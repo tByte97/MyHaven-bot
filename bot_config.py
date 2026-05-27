@@ -4,6 +4,9 @@ from typing import Optional
 import os
 
 
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+
+
 @dataclass(frozen=True)
 class BotConfig:
     """Конфігурація запуску Telegram bot."""
@@ -37,6 +40,16 @@ def _clean_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def _resolve_data_dir(value: str | None) -> Path:
+    if not value:
+        return DEFAULT_DATA_DIR
+
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (Path(__file__).resolve().parent / path).resolve()
+
+
 def load_config() -> BotConfig:
     # Завантажує конфігурацію зі змінних середовища.
 
@@ -54,7 +67,7 @@ def load_config() -> BotConfig:
 
     webapp_url = os.getenv("TELEGRAM_WEBAPP_URL", "").strip() or None
 
-    data_dir = Path(os.getenv("BOT_DATA_DIR", "./data"))
+    data_dir = _resolve_data_dir(os.getenv("BOT_DATA_DIR", "").strip() or None)
 
     timeout_value = os.getenv("REQUEST_TIMEOUT_SECONDS", "15").strip() or "15"
     request_timeout = float(timeout_value)

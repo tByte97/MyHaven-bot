@@ -52,6 +52,7 @@ def main() -> None:
     application.add_error_handler(_on_error)
 
     logging.getLogger(__name__).info("Bot started")
+    logging.getLogger(__name__).info("Bot data dir: %s", config.data_dir)
 
     application.run_polling()
 

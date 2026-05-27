@@ -20,6 +20,20 @@ def build_telegram_path(suffix: str) -> str:
     return f"/api/telegram/{clean}/"
 
 
+def build_users_path(suffix: str) -> str:
+    # Формує шлях users API з початковим і кінцевим слешем.
+
+    clean = suffix.strip("/")
+    return f"/api/users/{clean}/"
+
+
+def build_transactions_api_path(suffix: str) -> str:
+    # Формує шлях transactions API з початковим і кінцевим слешем.
+
+    clean = suffix.strip("/")
+    return f"/transactions/api/{clean}/"
+
+
 class BackendClient:
     """Обгортка HTTP-клієнта для викликів MyHaven backend."""
 

@@ -1,3 +1,10 @@
+import base64
+import datetime
+import json
+import os
+import re
+import tempfile
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Optional, Dict, Any
@@ -6,7 +13,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
 
-from .backend_client import ApiResult, BackendClient, build_telegram_path
+from .backend_client import (
+    ApiResult,
+    BackendClient,
+    build_telegram_path,
+    build_transactions_api_path,
+    build_users_path,
+)
 from .bot_config import BotConfig
 from .storage import LinkStore, LinkedAccount
 from .text_normalization import clean_transaction_description, resolve_spoken_category
@@ -14,15 +27,11 @@ from .utils import format_response, parse_kv_args, parse_payload
 
 from telegrambot.ai_processor import AIProcessor
 
-import datetime
-import os
-import re
-import tempfile
-
 
 MENU_BUTTON = "📋 Меню"
 HELP_BUTTON = "ℹ️ Допомога"
 EXTRA_BUTTON = "⚙️ Інші дії"
+REGISTER_BUTTON = "🆕 Створити акаунт"
 LINK_BUTTON = "🔗 Прив'язати акаунт"
 UNLINK_BUTTON = "❌ Відв'язати акаунт"
 HEALTH_BUTTON = "🩺 API health"
@@ -42,14 +51,64 @@ BUDGET_DETAIL_BUTTON = "🔎 Бюджет ID"
 CREATE_BUDGET_BUTTON = "➕ Створити бюджет"
 UPDATE_BUDGET_BUTTON = "✏️ Оновити бюджет"
 DELETE_BUDGET_BUTTON = "🗑 Видалити бюджет"
+DELETE_ACCOUNT_CONFIRM_TEXT = "ПІДТВЕРДЖУЮ ВИДАЛЕННЯ"
+REGISTRATION_CONFIRM_TEXT = "ПІДТВЕРДЖУЮ РЕЄСТРАЦІЮ"
+
+LANGUAGE_CHOICES = {
+    "uk": "Українська",
+    "en": "English",
+    "de": "Deutsch",
+    "es": "Español",
+    "pl": "Polski",
+}
+THEME_CHOICES = {
+    "light": "Світла",
+    "dark": "Темна",
+    "auto": "Авто",
+}
+CURRENCY_CHOICES = {"UAH", "USD", "EUR", "PLN", "GBP", "CHF"}
+TRACKING_SOURCE_ALIASES = {
+    "cash": "cash",
+    "готівка": "cash",
+    "card": "card",
+    "картка": "card",
+    "карта": "card",
+    "bank": "bank",
+    "банк": "bank",
+    "wallet": "wallet",
+    "гаманець": "wallet",
+    "savings": "savings",
+    "заощадження": "savings",
+    "all": "all",
+    "усі": "all",
+    "всі": "all",
+}
+TRACKING_SOURCE_LABELS = {
+    "cash": "готівка",
+    "card": "картка",
+    "bank": "банк",
+    "wallet": "гаманець",
+    "savings": "заощадження",
+    "all": "усі",
+}
+REGISTRATION_TRIGGER_TEXTS = {
+    "/register",
+    "register",
+    "реєстрація",
+    "зареєструватися",
+    "зареєструй мене",
+    "створити акаунт",
+    "створити аккаунт",
+}
 
 MAIN_KEYBOARD = [
     [DASHBOARD_BUTTON, TRANSACTIONS_BUTTON],
     [CREATE_TRANSACTION_BUTTON, STATISTICS_BUTTON],
     [BUDGETS_BUTTON, CALENDAR_BUTTON],
     [CATEGORIES_BUTTON, WEBAPP_BUTTON],
-    [LINK_BUTTON, HELP_BUTTON],
-    [EXTRA_BUTTON, MENU_BUTTON],
+    [REGISTER_BUTTON, LINK_BUTTON],
+    [HELP_BUTTON, EXTRA_BUTTON],
+    [MENU_BUTTON],
 ]
 
 EXTRA_KEYBOARD = [
@@ -78,6 +137,7 @@ class BotServices:
         self._log_dir.mkdir(exist_ok=True)
         self._pending_clarifications: Dict[int, Dict[str, Any]] = {}
         self._pending_quick_actions: Dict[int, Dict[str, str]] = {}
+        self._pending_registrations: Dict[int, Dict[str, Any]] = {}
         self._ai = AIProcessor(
             whisper_model_size=config.whisper_model,
             provider=config.ai_provider,
@@ -95,8 +155,8 @@ class BotServices:
         await update.message.reply_text(
             (
                 "Вітаю в MyHaven bot.\n"
-                "Користуйся кнопками нижче для швидких дій. "
-                "Для прив'язки акаунта натисни кнопку прив'язки й надішли секретний ключ."
+                "Якщо акаунт уже існує, натисни кнопку прив'язки й надішли секретний ключ.\n"
+                "Якщо ще не маєш профілю, натисни кнопку створення акаунта або введи /register."
             ),
             reply_markup=self._main_keyboard(),
         )
@@ -111,12 +171,28 @@ class BotServices:
                 "Швидкі дії доступні через кнопки нижче.\n\n"
                 "Основні кнопки: дашборд, транзакції, додати транзакцію, статистика, бюджети, календар, категорії, WebApp.\n"
                 "Додаткові кнопки: деталі/оновлення/видалення за ID, день календаря, створення й редагування бюджетів, API health, відв'язка акаунта.\n\n"
+                "Без акаунта можна або створити новий профіль через /register, або прив'язати наявний через секретний ключ.\n"
                 "Також можна просто написати природною мовою або надіслати голосове повідомлення, наприклад: "
-                "\"додав витрату 250 грн на продукти\".\n"
+                "\"додав витрату 250 грн на продукти\", \"покажи мій профіль\", "
+                "\"зміни тему на темну\", \"увімкни 2FA\", \"експортуй мої дані\".\n"
                 "Для імпорту виписки надішли PDF/CSV/XLS/XLSX з підписом bank=ID або bank_name=NAME."
             ),
             reply_markup=self._extra_keyboard(),
         )
+
+    async def register_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Запускає покрокову реєстрацію нового акаунта через Telegram.
+
+        if not update.message or not update.effective_user:
+            return
+        if self._require_link(update):
+            await self._reply_text(
+                update,
+                "Цей Telegram уже прив'язаний до акаунта. Якщо хочеш створити новий профіль, спочатку відв'яжи поточний.",
+            )
+            return
+
+        await self._start_registration(update)
 
     async def link(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Прив'язує користувача Telegram до токенів backend.
@@ -475,6 +551,292 @@ class BotServices:
         )
         await update.message.reply_text("Open MyHaven WebApp:", reply_markup=keyboard)
 
+    async def _start_registration(self, update: Update) -> None:
+        if not update.effective_user:
+            return
+
+        self._pending_quick_actions.pop(update.effective_user.id, None)
+        self._pending_clarifications.pop(update.effective_user.id, None)
+        self._pending_registrations[update.effective_user.id] = {
+            "step_index": 0,
+            "confirming": False,
+            "data": {},
+            "created_at": datetime.datetime.utcnow().isoformat(),
+        }
+        await self._reply_text(
+            update,
+            (
+                "Починаємо реєстрацію в MyHaven через Telegram.\n"
+                "Я послідовно запитаю ті самі дані, що потрібні для створення профілю.\n"
+                "У будь-який момент напиши «скасувати», щоб зупинити процес."
+            ),
+        )
+        await self._reply_text(update, self._registration_prompt(0))
+
+    def _registration_prompt(self, step_index: int) -> str:
+        prompts = [
+            "1/10. Введи ім'я або `-`, якщо хочеш пропустити.",
+            "2/10. Введи прізвище або `-`, якщо хочеш пропустити.",
+            "3/10. Введи username для входу. Без пробілів, наприклад: `myhaven_user`.",
+            "4/10. Введи email, наприклад: `name@example.com`.",
+            "5/10. Введи пароль. Мінімум 8 символів.",
+            (
+                "6/10. Введи мову інтерфейсу.\n"
+                f"Доступні значення: {', '.join(LANGUAGE_CHOICES.keys())}."
+            ),
+            (
+                "7/10. Введи базову валюту.\n"
+                f"Доступні значення: {', '.join(sorted(CURRENCY_CHOICES))}."
+            ),
+            (
+                "8/10. Введи валюту відображення.\n"
+                f"Доступні значення: {', '.join(sorted(CURRENCY_CHOICES))}."
+            ),
+            (
+                "9/10. Введи джерела відстеження через кому.\n"
+                "Доступні значення: cash, card, bank, wallet, savings, all.\n"
+                "Можна також українською: готівка, картка, банк, гаманець, заощадження, усі."
+            ),
+            (
+                "10/10. Введи тему оформлення.\n"
+                f"Доступні значення: {', '.join(THEME_CHOICES.keys())}."
+            ),
+        ]
+        return prompts[step_index]
+
+    def _registration_field_name(self, step_index: int) -> str:
+        return [
+            "first_name",
+            "last_name",
+            "username",
+            "email",
+            "password",
+            "language",
+            "currency",
+            "display_currency",
+            "tracking_sources",
+            "theme",
+        ][step_index]
+
+    def _parse_registration_value(self, field: str, text: str) -> tuple[Optional[Any], Optional[str]]:
+        raw = text.strip()
+        lowered = raw.lower()
+
+        if field in {"first_name", "last_name"}:
+            if lowered in {"-", "skip", "пропустити"}:
+                return "", None
+            if not raw:
+                return None, "Поле не може бути порожнім. Введи значення або `-`, щоб пропустити."
+            return raw, None
+
+        if field == "username":
+            if not raw:
+                return None, "Username обов'язковий."
+            if " " in raw:
+                return None, "Username не повинен містити пробілів."
+            if len(raw) < 3:
+                return None, "Username має містити щонайменше 3 символи."
+            return raw, None
+
+        if field == "email":
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", raw):
+                return None, "Введи коректний email у форматі name@example.com."
+            return raw, None
+
+        if field == "password":
+            if len(raw) < 8:
+                return None, "Пароль має містити щонайменше 8 символів."
+            return raw, None
+
+        if field == "language":
+            aliases = {
+                "українська": "uk",
+                "англійська": "en",
+                "німецька": "de",
+                "іспанська": "es",
+                "польська": "pl",
+            }
+            value = aliases.get(lowered, lowered)
+            if value not in LANGUAGE_CHOICES:
+                return None, f"Доступні мови: {', '.join(LANGUAGE_CHOICES.keys())}."
+            return value, None
+
+        if field in {"currency", "display_currency"}:
+            aliases = {
+                "грн": "UAH",
+                "uah": "UAH",
+                "usd": "USD",
+                "eur": "EUR",
+                "pln": "PLN",
+                "gbp": "GBP",
+                "chf": "CHF",
+            }
+            value = aliases.get(lowered, raw.upper())
+            if value not in CURRENCY_CHOICES:
+                return None, f"Доступні валюти: {', '.join(sorted(CURRENCY_CHOICES))}."
+            return value, None
+
+        if field == "tracking_sources":
+            normalized = raw.replace(" і ", ",").replace(";", ",")
+            parts = [item.strip().lower() for item in normalized.split(",") if item.strip()]
+            if len(parts) == 1 and " " in parts[0]:
+                parts = [item.strip().lower() for item in parts[0].split() if item.strip()]
+
+            values = []
+            for item in parts:
+                mapped = TRACKING_SOURCE_ALIASES.get(item)
+                if not mapped:
+                    return None, (
+                        "Не зміг розпізнати джерела. Використай, наприклад: "
+                        "`card, bank` або `картка, банк`."
+                    )
+                if mapped not in values:
+                    values.append(mapped)
+
+            if not values:
+                return None, "Оберіть хоча б одне джерело відстеження."
+            return values, None
+
+        if field == "theme":
+            aliases = {
+                "світла": "light",
+                "темна": "dark",
+                "авто": "auto",
+                "system": "auto",
+            }
+            value = aliases.get(lowered, lowered)
+            if value not in THEME_CHOICES:
+                return None, f"Доступні теми: {', '.join(THEME_CHOICES.keys())}."
+            return value, None
+
+        return raw, None
+
+    def _registration_summary(self, data: Dict[str, Any]) -> str:
+        tracking_sources = data.get("tracking_sources") or []
+        tracking_text = ", ".join(
+            TRACKING_SOURCE_LABELS.get(str(item), str(item))
+            for item in tracking_sources
+        ) or "не вказано"
+
+        return "\n".join([
+            "Перевір дані реєстрації:",
+            f"Ім'я: {data.get('first_name') or '—'}",
+            f"Прізвище: {data.get('last_name') or '—'}",
+            f"Username: {data.get('username') or '—'}",
+            f"Email: {data.get('email') or '—'}",
+            f"Пароль: {'*' * max(len(str(data.get('password') or '')), 8)}",
+            f"Мова: {data.get('language') or '—'}",
+            f"Базова валюта: {data.get('currency') or '—'}",
+            f"Валюта відображення: {data.get('display_currency') or '—'}",
+            f"Джерела відстеження: {tracking_text}",
+            f"Тема: {data.get('theme') or '—'}",
+            "",
+            (
+                "Якщо все правильно, надішли точну фразу "
+                f"«{REGISTRATION_CONFIRM_TEXT}».\n"
+                "Щоб перервати процес, напиши «скасувати»."
+            ),
+        ])
+
+    def _is_registration_trigger(self, text: str) -> bool:
+        normalized = (text or "").strip().lower()
+        return normalized in REGISTRATION_TRIGGER_TEXTS
+
+    async def _submit_registration(self, update: Update, registration: Dict[str, Any]) -> None:
+        if not update.effective_user:
+            return
+
+        payload = dict(registration.get("data") or {})
+        payload["telegram_user_id"] = update.effective_user.id
+        payload["telegram_username"] = update.effective_user.username
+
+        result = await self._client.request(
+            "POST",
+            build_users_path("telegram/register"),
+            json=payload,
+        )
+
+        self._pending_registrations.pop(update.effective_user.id, None)
+
+        if result.error or not isinstance(result.data, dict):
+            await self._reply_result(update, result)
+            await self._reply_text(update, "Реєстрацію не завершено. За потреби запусти /register ще раз.")
+            return
+
+        access_token = result.data.get("access")
+        refresh_token = result.data.get("refresh")
+        if not access_token:
+            await self._reply_text(update, "Реєстрація завершилась некоректно: не отримав access token.")
+            return
+
+        account = LinkedAccount(
+            telegram_user_id=update.effective_user.id,
+            telegram_username=update.effective_user.username,
+            access_token=str(access_token),
+            refresh_token=str(refresh_token) if refresh_token else None,
+            linked_at=self._store.now_iso(),
+        )
+        self._store.save(account)
+
+        await self._reply_text(
+            update,
+            (
+                "Акаунт успішно створено через Telegram і одразу прив'язано до цього бота.\n"
+                "Тепер можеш користуватися командами, голосовими повідомленнями та швидкими кнопками."
+            ),
+        )
+
+    async def _try_handle_registration_reply(self, update: Update, text: str) -> bool:
+        if not update.effective_user:
+            return False
+
+        registration = self._pending_registrations.get(update.effective_user.id)
+        if not registration:
+            return False
+
+        lowered = text.strip().lower()
+        if lowered in {"cancel", "скасувати"}:
+            self._pending_registrations.pop(update.effective_user.id, None)
+            await self._reply_text(update, "Реєстрацію скасовано.")
+            return True
+
+        if registration.get("confirming"):
+            if text.strip().upper() != REGISTRATION_CONFIRM_TEXT:
+                await self._reply_text(
+                    update,
+                    (
+                        "Для завершення реєстрації надішли точну фразу "
+                        f"«{REGISTRATION_CONFIRM_TEXT}» або напиши «скасувати»."
+                    ),
+                )
+                return True
+
+            await self._submit_registration(update, registration)
+            return True
+
+        step_index = int(registration.get("step_index", 0))
+        field = self._registration_field_name(step_index)
+        value, error_message = self._parse_registration_value(field, text)
+        if error_message:
+            await self._reply_text(update, error_message)
+            await self._reply_text(update, self._registration_prompt(step_index))
+            return True
+
+        registration_data = dict(registration.get("data") or {})
+        registration_data[field] = value
+        registration["data"] = registration_data
+        registration["step_index"] = step_index + 1
+
+        if registration["step_index"] >= 10:
+            registration["confirming"] = True
+            self._pending_registrations[update.effective_user.id] = registration
+            await self._reply_text(update, self._registration_summary(registration_data))
+            return True
+
+        self._pending_registrations[update.effective_user.id] = registration
+        await self._reply_text(update, self._registration_prompt(registration["step_index"]))
+        return True
+
     def _main_keyboard(self) -> ReplyKeyboardMarkup:
         return ReplyKeyboardMarkup(MAIN_KEYBOARD, resize_keyboard=True, is_persistent=True)
 
@@ -510,6 +872,10 @@ class BotServices:
 
         if text == EXTRA_BUTTON:
             await self._reply_text(update, "Додаткові швидкі дії:", reply_markup=self._extra_keyboard())
+            return True
+
+        if text == REGISTER_BUTTON:
+            await self.register_account(update, context)
             return True
 
         if text == LINK_BUTTON:
@@ -985,6 +1351,76 @@ class BotServices:
         parts = update.message.text.split(maxsplit=1)
         return parts[1] if len(parts) > 1 else ""
 
+    @staticmethod
+    def _filter_fields(payload: Dict[str, Any], allowed: set[str]) -> Dict[str, Any]:
+        return {
+            key: value for key, value in payload.items()
+            if key in allowed and value is not None
+        }
+
+    @staticmethod
+    def _subset_result_data(payload: Any, keys: tuple[str, ...]) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        return {key: payload.get(key) for key in keys if key in payload}
+
+    @staticmethod
+    def _extract_totp_code(text: str) -> Optional[str]:
+        match = re.search(r"\b(\d{6})\b", text or "")
+        if not match:
+            return None
+        return match.group(1)
+
+    async def _send_totp_setup(self, update: Update, payload: Dict[str, Any]) -> None:
+        if not update.message:
+            return
+
+        secret = str(payload.get("secret", "") or "").strip()
+        qr_code = str(payload.get("qr_code", "") or "").strip()
+        caption = (
+            "Відскануй QR-код у застосунку-аутентифікаторі.\n"
+            f"Секрет: {secret}\n"
+            "Потім надішли мені 6-значний код, і я увімкну 2FA."
+        )
+
+        if qr_code.startswith("data:image") and "," in qr_code:
+            try:
+                encoded = qr_code.split(",", 1)[1]
+                image_bytes = base64.b64decode(encoded)
+                photo = BytesIO(image_bytes)
+                photo.name = "myhaven_totp.png"
+                photo.seek(0)
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption=caption,
+                    reply_markup=self._main_keyboard(),
+                )
+                return
+            except Exception:
+                pass
+
+        await self._reply_text(update, caption)
+
+    async def _send_export_document(self, update: Update, payload: Any) -> None:
+        if not update.message:
+            return
+
+        content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ).encode("utf-8")
+        document = BytesIO(content)
+        document.name = f"myhaven_export_{datetime.date.today().isoformat()}.json"
+        document.seek(0)
+        await update.message.reply_document(
+            document=document,
+            filename=document.name,
+            caption="Підготував експорт ваших даних у JSON.",
+            reply_markup=self._main_keyboard(),
+        )
+
     async def _reply_result(
         self,
         update: Update,
@@ -999,7 +1435,7 @@ class BotServices:
                 await self._send_category_retry_prompt(update, missing_category)
                 return
         if result.error:
-            message = f"Request failed ({result.status_code}).\n{format_response(result.data)}"
+            message = f"Не вдалося виконати запит ({result.status_code}).\n{format_response(result.data)}"
         elif result.status_code == 204 or result.data == "":
             message = "Готово."
         else:
@@ -1100,7 +1536,70 @@ class BotServices:
         if not update.effective_user:
             return False
         pending = self._pending_clarifications.get(update.effective_user.id)
-        if not pending or pending.get("kind") != "retry_payload":
+        if not pending:
+            return False
+
+        kind = pending.get("kind")
+
+        if kind == "totp_enable":
+            if text.strip().lower() in {"cancel", "скасувати"}:
+                self._pending_clarifications.pop(update.effective_user.id, None)
+                await self._reply_text(update, "Налаштування 2FA скасовано.")
+                return True
+
+            code = self._extract_totp_code(text)
+            if not code:
+                await self._reply_text(
+                    update,
+                    "Надішли 6-значний код із застосунку-аутентифікатора або напиши «скасувати».",
+                )
+                return True
+
+            secret = pending.get("secret")
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("totp/enable"),
+                json={"secret": secret, "code": code},
+            )
+
+            if not result.error:
+                self._pending_clarifications.pop(update.effective_user.id, None)
+
+            await self._reply_result(update, result)
+            return True
+
+        if kind == "delete_account_confirmation":
+            normalized = text.strip().upper()
+            if text.strip().lower() in {"cancel", "скасувати"}:
+                self._pending_clarifications.pop(update.effective_user.id, None)
+                await self._reply_text(update, "Видалення акаунта скасовано.")
+                return True
+
+            if normalized != DELETE_ACCOUNT_CONFIRM_TEXT:
+                await self._reply_text(
+                    update,
+                    (
+                        "Для підтвердження надішли точну фразу "
+                        f"«{DELETE_ACCOUNT_CONFIRM_TEXT}» або напиши «скасувати»."
+                    ),
+                )
+                return True
+
+            self._pending_clarifications.pop(update.effective_user.id, None)
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("delete-account"),
+                json={"password": pending.get("password")},
+            )
+            if not result.error:
+                self._store.remove(update.effective_user.id)
+
+            await self._reply_result(update, result)
+            return True
+
+        if kind != "retry_payload":
             return False
 
         retry = pending.get("retry") or {}
@@ -1179,12 +1678,24 @@ class BotServices:
         if await self._try_handle_quick_action_reply(update, context, text):
             return
 
-        link = self._require_link(update)
-        if not link:
-            await self._reply_text(update, "Спочатку прив'яжи акаунт кнопкою прив'язки.")
+        if await self._try_handle_pending_reply(update, text):
             return
 
-        if await self._try_handle_pending_reply(update, text):
+        if await self._try_handle_registration_reply(update, text):
+            return
+
+        link = self._require_link(update)
+        if not link:
+            if self._is_registration_trigger(text):
+                await self._start_registration(update)
+                return
+            await self._reply_text(
+                update,
+                (
+                    "Спочатку створи новий акаунт через /register або натисни кнопку "
+                    "«Створити акаунт». Якщо профіль уже існує, скористайся кнопкою прив'язки."
+                ),
+            )
             return
 
         pending = self._pending_clarifications.get(update.effective_user.id)
@@ -1393,6 +1904,9 @@ class BotServices:
 
         elif action == "delete_transaction":
             tid = intent.get("id")
+            if not tid:
+                await self._reply_text(update, "Потрібне уточнення: яку транзакцію видалити?")
+                return
             result = await self._call_api(
                 update, "DELETE", build_telegram_path(f"transactions/{tid}")
             )
@@ -1400,6 +1914,9 @@ class BotServices:
 
         elif action == "update_transaction":
             tid = intent.get("id")
+            if not tid:
+                await self._reply_text(update, "Потрібне уточнення: яку транзакцію оновити?")
+                return
             fields = dict(intent.get("fields", {}))
             if "date" in fields and "transaction_date" not in fields:
                 fields["transaction_date"] = fields.pop("date")
@@ -1418,13 +1935,288 @@ class BotServices:
             result = await self._call_api(update, "GET", build_telegram_path("health"))
             retry = None
 
+        elif action == "get_profile":
+            result = await self._call_api(update, "GET", build_users_path("me"))
+            retry = None
+
+        elif action == "update_profile":
+            fields = self._filter_fields(
+                dict(intent.get("fields") or {}),
+                {"first_name", "last_name", "email"},
+            )
+            if not fields:
+                await self._reply_text(update, "Потрібне уточнення: які саме поля профілю змінити?")
+                return
+            result = await self._call_api(
+                update,
+                "PATCH",
+                build_users_path("profile"),
+                json=fields,
+            )
+            retry = None
+
+        elif action == "get_preferences":
+            result = await self._call_api(update, "GET", build_users_path("me"))
+            if not result.error:
+                result = ApiResult(
+                    status_code=result.status_code,
+                    data=self._subset_result_data(
+                        result.data,
+                        (
+                            "theme",
+                            "language",
+                            "currency",
+                            "display_currency",
+                            "tracking_sources",
+                            "onboarding_completed",
+                        ),
+                    ),
+                    error=None,
+                )
+            retry = None
+
+        elif action == "update_preferences":
+            fields = self._filter_fields(
+                dict(intent.get("fields") or {}),
+                {
+                    "theme",
+                    "language",
+                    "currency",
+                    "display_currency",
+                    "tracking_sources",
+                    "onboarding_completed",
+                },
+            )
+            if not fields:
+                await self._reply_text(update, "Потрібне уточнення: які налаштування змінити?")
+                return
+            result = await self._call_api(
+                update,
+                "PATCH",
+                build_users_path("preferences"),
+                json=fields,
+            )
+            retry = None
+
+        elif action == "get_notifications":
+            result = await self._call_api(update, "GET", build_users_path("me"))
+            if not result.error:
+                result = ApiResult(
+                    status_code=result.status_code,
+                    data=self._subset_result_data(
+                        result.data,
+                        (
+                            "email_notifications",
+                            "telegram_notifications",
+                            "notify_large_expense",
+                            "notify_budget_exceeded",
+                            "notify_daily_summary",
+                            "telegram_user_id",
+                            "telegram_username",
+                        ),
+                    ),
+                    error=None,
+                )
+            retry = None
+
+        elif action == "update_notifications":
+            fields = self._filter_fields(
+                dict(intent.get("fields") or {}),
+                {
+                    "email_notifications",
+                    "telegram_notifications",
+                    "notify_large_expense",
+                    "notify_budget_exceeded",
+                    "notify_daily_summary",
+                },
+            )
+            if not fields:
+                await self._reply_text(update, "Потрібне уточнення: які сповіщення змінити?")
+                return
+            result = await self._call_api(
+                update,
+                "PATCH",
+                build_users_path("notifications"),
+                json=fields,
+            )
+            retry = None
+
+        elif action == "change_password":
+            old_password = intent.get("old_password")
+            new_password = intent.get("new_password")
+            if not old_password or not new_password:
+                await self._reply_text(update, "Потрібне уточнення: потрібен поточний і новий пароль.")
+                return
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("change-password"),
+                json={
+                    "old_password": old_password,
+                    "new_password": new_password,
+                },
+            )
+            retry = None
+
+        elif action == "setup_totp":
+            result = await self._call_api(update, "GET", build_users_path("totp/setup"))
+            if result.error:
+                await self._reply_result(update, result)
+                return
+            if user_id is not None and isinstance(result.data, dict):
+                self._pending_clarifications[user_id] = {
+                    "kind": "totp_enable",
+                    "secret": result.data.get("secret"),
+                    "created_at": datetime.datetime.utcnow().isoformat(),
+                }
+            await self._send_totp_setup(update, result.data if isinstance(result.data, dict) else {})
+            return
+
+        elif action == "enable_totp":
+            code = intent.get("code") or self._extract_totp_code(raw_text or "")
+            secret = intent.get("secret")
+            if not secret and isinstance(pending_before_dispatch, dict):
+                secret = pending_before_dispatch.get("secret")
+            if not secret:
+                await self._reply_text(
+                    update,
+                    "Спочатку попроси мене налаштувати 2FA, щоб я згенерував секрет і QR-код.",
+                )
+                return
+            if not code:
+                if user_id is not None:
+                    self._pending_clarifications[user_id] = {
+                        "kind": "totp_enable",
+                        "secret": secret,
+                        "created_at": datetime.datetime.utcnow().isoformat(),
+                    }
+                await self._reply_text(update, "Надішли 6-значний код із застосунку-аутентифікатора.")
+                return
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("totp/enable"),
+                json={"secret": secret, "code": code},
+            )
+            if result.error and user_id is not None:
+                self._pending_clarifications[user_id] = {
+                    "kind": "totp_enable",
+                    "secret": secret,
+                    "created_at": datetime.datetime.utcnow().isoformat(),
+                }
+            retry = None
+
+        elif action == "disable_totp":
+            password = intent.get("password")
+            if not password:
+                await self._reply_text(update, "Потрібне уточнення: введи пароль для вимкнення 2FA.")
+                return
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("totp/disable"),
+                json={"password": password},
+            )
+            retry = None
+
+        elif action == "verify_totp":
+            code = intent.get("code") or self._extract_totp_code(raw_text or "")
+            if not code:
+                await self._reply_text(update, "Потрібне уточнення: надішли 6-значний код 2FA.")
+                return
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("totp/verify"),
+                json={"code": code},
+            )
+            retry = None
+
+        elif action == "create_telegram_link_code":
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("telegram/link-code"),
+            )
+            retry = None
+
+        elif action == "unlink_telegram":
+            result = await self._call_api(
+                update,
+                "DELETE",
+                build_users_path("telegram/unlink"),
+            )
+            if not result.error and user_id is not None:
+                self._store.remove(user_id)
+            retry = None
+
+        elif action == "export_data":
+            result = await self._call_api(update, "GET", build_users_path("export-data"))
+            if result.error:
+                await self._reply_result(update, result)
+                return
+            await self._send_export_document(update, result.data)
+            return
+
+        elif action == "delete_account":
+            password = intent.get("password")
+            confirmed = bool(intent.get("confirmed"))
+            if not password:
+                await self._reply_text(update, "Потрібне уточнення: введи пароль для видалення акаунта.")
+                return
+            if not confirmed:
+                if user_id is not None:
+                    self._pending_clarifications[user_id] = {
+                        "kind": "delete_account_confirmation",
+                        "password": password,
+                        "created_at": datetime.datetime.utcnow().isoformat(),
+                    }
+                await self._reply_text(
+                    update,
+                    (
+                        "Це незворотна дія. Для підтвердження надішли точну фразу "
+                        f"«{DELETE_ACCOUNT_CONFIRM_TEXT}» або напиши «скасувати»."
+                    ),
+                )
+                return
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("delete-account"),
+                json={"password": password},
+            )
+            if not result.error and user_id is not None:
+                self._store.remove(user_id)
+            retry = None
+
+        elif action == "get_uploads":
+            result = await self._call_api(update, "GET", build_transactions_api_path("uploads"))
+            retry = None
+
+        elif action == "delete_upload":
+            upload_id = intent.get("id")
+            if not upload_id:
+                await self._reply_text(update, "Потрібне уточнення: яку виписку видалити?")
+                return
+            result = await self._call_api(
+                update,
+                "DELETE",
+                build_transactions_api_path(f"uploads/{upload_id}"),
+            )
+            retry = None
+
+        elif action == "get_banks":
+            result = await self._call_api(update, "GET", build_transactions_api_path("banks"))
+            retry = None
+
         elif action == "assistant_help":
             await self._reply_text(
                 update,
                 intent.get("message")
                 or (
-                    "Можу вести облік через чат: додавати витрати й доходи, "
-                    "показувати транзакції, статистику, бюджети, календар і уточнювати деталі."
+                    "Можу керувати фінансами і профілем через чат: транзакції, бюджети, "
+                    "календар, статистика, профіль, тему, мову, сповіщення, 2FA, "
+                    "Telegram-прив'язку, банки, виписки та експорт даних."
                 ),
             )
             return
@@ -1442,6 +2234,7 @@ def register_handlers(application: Any, services: BotServices) -> None:
 
     application.add_handler(CommandHandler("start", services.start))
     application.add_handler(CommandHandler("help", services.help))
+    application.add_handler(CommandHandler("register", services.register_account))
     application.add_handler(CommandHandler("link", services.link))
     application.add_handler(CommandHandler("unlink", services.unlink))
     application.add_handler(CommandHandler("health", services.health))

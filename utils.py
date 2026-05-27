@@ -78,6 +78,59 @@ def _category_name(category: Any) -> str:
     return str(category) if category else "без категорії"
 
 
+def _format_toggle(value: Any) -> str:
+    return "увімкнено" if bool(value) else "вимкнено"
+
+
+def _format_yes_no(value: Any) -> str:
+    return "так" if bool(value) else "ні"
+
+
+def _format_tracking_sources(value: Any) -> str:
+    if not isinstance(value, list) or not value:
+        return "не вказано"
+
+    labels = {
+        "cash": "готівка",
+        "card": "картка",
+        "bank": "банк",
+        "wallet": "гаманець",
+        "savings": "заощадження",
+        "all": "усі",
+    }
+    return ", ".join(labels.get(str(item), str(item)) for item in value)
+
+
+def _format_theme(value: Any) -> str:
+    labels = {
+        "light": "світла",
+        "dark": "темна",
+        "auto": "авто",
+    }
+    return labels.get(str(value), str(value) if value else "не вказано")
+
+
+def _format_language(value: Any) -> str:
+    labels = {
+        "uk": "українська",
+        "en": "англійська",
+        "de": "німецька",
+        "es": "іспанська",
+        "pl": "польська",
+    }
+    return labels.get(str(value), str(value) if value else "не вказано")
+
+
+def _format_telegram_status(data: Dict[str, Any]) -> str:
+    username = data.get("telegram_username")
+    user_id = data.get("telegram_user_id")
+    if username:
+        return f"@{username}"
+    if user_id:
+        return f"ID {user_id}"
+    return "не прив'язано"
+
+
 def _format_transaction(data: Dict[str, Any]) -> str:
     lines = [
         f"Транзакцію збережено #{data.get('id')}",
@@ -133,6 +186,89 @@ def _format_budget(data: Dict[str, Any]) -> str:
         f"Ліміт: {_format_amount(data.get('amount'))}",
         f"Вже витрачено: {_format_amount(data.get('spent', 0))}",
     ])
+
+
+def _format_profile(data: Dict[str, Any]) -> str:
+    lines = [
+        "Профіль",
+        f"Username: {data.get('username') or '—'}",
+        f"Email: {data.get('email') or '—'}",
+        f"Ім'я: {data.get('first_name') or '—'}",
+        f"Прізвище: {data.get('last_name') or '—'}",
+        f"Дата реєстрації: {_format_date(data.get('date_joined'))}",
+        f"2FA: {_format_toggle(data.get('totp_enabled'))}",
+        f"Тема: {_format_theme(data.get('theme'))}",
+        f"Мова: {_format_language(data.get('language'))}",
+        f"Базова валюта: {data.get('currency') or '—'}",
+        f"Валюта відображення: {data.get('display_currency') or '—'}",
+        f"Джерела відстеження: {_format_tracking_sources(data.get('tracking_sources'))}",
+        f"Онбординг завершено: {_format_yes_no(data.get('onboarding_completed'))}",
+        f"Telegram: {_format_telegram_status(data)}",
+    ]
+    return "\n".join(lines)
+
+
+def _format_preferences(data: Dict[str, Any]) -> str:
+    return "\n".join([
+        "Налаштування",
+        f"Тема: {_format_theme(data.get('theme'))}",
+        f"Мова: {_format_language(data.get('language'))}",
+        f"Базова валюта: {data.get('currency') or '—'}",
+        f"Валюта відображення: {data.get('display_currency') or '—'}",
+        f"Джерела відстеження: {_format_tracking_sources(data.get('tracking_sources'))}",
+        f"Онбординг завершено: {_format_yes_no(data.get('onboarding_completed'))}",
+    ])
+
+
+def _format_notifications(data: Dict[str, Any]) -> str:
+    lines = [
+        "Сповіщення",
+        f"Email: {_format_toggle(data.get('email_notifications'))}",
+        f"Telegram: {_format_toggle(data.get('telegram_notifications'))}",
+        f"Великі витрати: {_format_toggle(data.get('notify_large_expense'))}",
+        f"Перевищення бюджету: {_format_toggle(data.get('notify_budget_exceeded'))}",
+        f"Щоденний звіт: {_format_toggle(data.get('notify_daily_summary'))}",
+    ]
+    if "telegram_user_id" in data or "telegram_username" in data:
+        lines.append(f"Telegram акаунт: {_format_telegram_status(data)}")
+    return "\n".join(lines)
+
+
+def _format_telegram_link_code(data: Dict[str, Any]) -> str:
+    return "\n".join([
+        "Ключ для прив'язки Telegram",
+        f"Секрет: {data.get('secret')}",
+        f"Дійсний до: {_format_date(data.get('expires_at'))}",
+        "Надішли цей ключ боту через кнопку прив'язки.",
+    ])
+
+
+def _format_banks(items: list[Any]) -> str:
+    if not items:
+        return "Банків не знайшов."
+    lines = ["Банки:"]
+    for item in items[:30]:
+        if isinstance(item, dict):
+            lines.append(f"- #{item.get('id')} | {item.get('name') or 'без назви'}")
+    if len(items) > 30:
+        lines.append("Показав перші 30 банків.")
+    return "\n".join(lines)
+
+
+def _format_uploads(items: list[Any]) -> str:
+    if not items:
+        return "Завантажених виписок поки немає."
+    lines = ["Виписки:"]
+    for item in items[:10]:
+        if isinstance(item, dict):
+            lines.append(
+                f"- #{item.get('id')} | {item.get('bank_name') or 'Невідомий банк'} | "
+                f"{item.get('status') or 'UNKNOWN'} | {_format_date(item.get('uploaded_at'))} | "
+                f"транзакцій {item.get('total_transactions', 0)}"
+            )
+    if len(items) > 10:
+        lines.append("Показав перші 10 виписок.")
+    return "\n".join(lines)
 
 
 def _format_budget_list(items: list[Any]) -> str:
@@ -216,9 +352,14 @@ def _format_calendar(data: Dict[str, Any]) -> str:
 
 
 def _format_error(data: Dict[str, Any]) -> str | None:
+    if "detail" in data and len(data) == 1:
+        return str(data.get("detail") or "")
+    if "error" in data and len(data) == 1:
+        return str(data.get("error") or "")
+
     detail = data.get("detail") or data.get("error")
     if detail:
-        return f"Не вдалося виконати запит: {detail}"
+        return str(detail)
     parts = []
     for key, value in data.items():
         if isinstance(value, list):
@@ -237,14 +378,26 @@ def format_response(data: Any, max_len: int = 3500) -> str:
         text = data
     elif isinstance(data, list):
         first = data[0] if data else {}
-        if isinstance(first, dict) and {"name", "type"}.issubset(first.keys()):
+        if isinstance(first, dict) and "uploaded_at" in first:
+            text = _format_uploads(data)
+        elif isinstance(first, dict) and {"name", "type"}.issubset(first.keys()):
             text = _format_category_list(data)
+        elif isinstance(first, dict) and {"id", "name"}.issubset(first.keys()):
+            text = _format_banks(data)
         elif isinstance(first, dict) and "transaction_date" in first:
             text = _format_transaction_items(data)
         else:
             text = _format_budget_list(data)
     elif isinstance(data, dict):
-        if "results" in data and "count" in data:
+        if {"username", "email", "totp_enabled"}.issubset(data.keys()):
+            text = _format_profile(data)
+        elif {"theme", "language", "currency", "display_currency"}.issubset(data.keys()):
+            text = _format_preferences(data)
+        elif "email_notifications" in data or "telegram_notifications" in data:
+            text = _format_notifications(data)
+        elif {"secret", "expires_at"}.issubset(data.keys()):
+            text = _format_telegram_link_code(data)
+        elif "results" in data and "count" in data:
             text = _format_transaction_list(data)
         elif {"total_expenses", "total_incomes", "balance"}.issubset(data.keys()):
             text = _format_dashboard(data)

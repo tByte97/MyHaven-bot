@@ -3,6 +3,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 import json
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,11 +84,17 @@ class LinkStore:
     def _load(self) -> None:
         if not self._file_path.exists():
             return
-        raw = json.loads(self._file_path.read_text(encoding="utf-8"))
+        try:
+            raw = json.loads(self._file_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse Telegram link store: %s", self._file_path)
+            return
         if isinstance(raw, dict):
             self._links = raw
 
     def _write(self) -> None:
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self._links, indent=2, ensure_ascii=True)
-        self._file_path.write_text(payload, encoding="utf-8")
+        tmp_path = self._file_path.with_name(f"{self._file_path.name}.tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        tmp_path.replace(self._file_path)
