@@ -1,4 +1,3 @@
-# AI processor: STT через faster-whisper і LLM через Gemini або Ollama.
 from __future__ import annotations
 
 import json

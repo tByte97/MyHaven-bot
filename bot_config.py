@@ -61,7 +61,7 @@ def load_config() -> BotConfig:
         os.getenv("MYHAVEN_API_BASE_URL", "http://localhost:8000").strip()
     )
 
-    link_endpoint = os.getenv("TELEGRAM_LINK_ENDPOINT", "").strip() or None
+    link_endpoint = os.getenv("TELEGRAM_LINK_ENDPOINT", "").strip() or "/api/users/telegram/link"
     if link_endpoint:
         link_endpoint = link_endpoint.rstrip("/")
 
