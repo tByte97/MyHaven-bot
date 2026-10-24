@@ -47,6 +47,7 @@ def main() -> None:
     backend_client = BackendClient(
         config.api_base_url,
         timeout=config.request_timeout,
+        bot_secret=config.backend_bot_secret,
     )
 
     services = BotServices(config, store, backend_client)

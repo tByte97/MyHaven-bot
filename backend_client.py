@@ -34,11 +34,16 @@ def build_transactions_api_path(suffix: str) -> str:
     return f"/transactions/api/{clean}/"
 
 
+BOT_SECRET_HEADER = "X-MyHaven-Bot-Secret"
+
+
 class BackendClient:
     """Обгортка HTTP-клієнта для викликів MyHaven backend."""
 
-    def __init__(self, base_url: str, timeout: float = 15.0) -> None:
-        self._client = httpx.AsyncClient(base_url=base_url, timeout=timeout)
+    def __init__(self, base_url: str, timeout: float = 15.0, bot_secret: Optional[str] = None) -> None:
+        # Секрет підтверджує бекенду, що telegram_user_id надсилає саме бот.
+        headers = {BOT_SECRET_HEADER: bot_secret} if bot_secret else None
+        self._client = httpx.AsyncClient(base_url=base_url, timeout=timeout, headers=headers)
 
     async def request(
         self,

@@ -25,6 +25,7 @@ class BotConfig:
     voice_max_seconds: int = 60
     ai_requests_per_minute: int = 10
     upload_max_bytes: int = 10 * 1024 * 1024
+    backend_bot_secret: Optional[str] = None
 
 @dataclass(frozen=True)
 class AiConfig:
@@ -88,6 +89,10 @@ def load_config() -> BotConfig:
         os.getenv("STATEMENT_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)).strip() or str(10 * 1024 * 1024)
     )
 
+    backend_bot_secret = os.getenv("MYHAVEN_BOT_API_SECRET", "").strip() or None
+    if not backend_bot_secret:
+        raise ValueError("MYHAVEN_BOT_API_SECRET is required (same value as TELEGRAM_BOT_API_SECRET on backend).")
+
     return BotConfig(
         bot_token=bot_token,
         api_base_url=api_base_url,
@@ -103,4 +108,5 @@ def load_config() -> BotConfig:
         voice_max_seconds=voice_max_seconds,
         ai_requests_per_minute=ai_requests_per_minute,
         upload_max_bytes=upload_max_bytes,
+        backend_bot_secret=backend_bot_secret,
     )
