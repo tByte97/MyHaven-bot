@@ -3,7 +3,9 @@
 import datetime
 import logging
 import re
-from typing import Any, Dict
+import time
+from collections import defaultdict, deque
+from typing import Any, Callable, Deque, Dict
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -57,3 +59,23 @@ async def delete_user_message(update: Update) -> bool:
     except TelegramError:
         logger.warning("Не вдалося видалити повідомлення з чутливими даними.")
         return False
+
+
+class SlidingWindowLimiter:
+    """Ліміт запитів на користувача (AI-обробка дорога: Whisper на CPU, квота LLM)."""
+
+    def __init__(self, max_calls: int, period_seconds: float, clock: Callable[[], float] = time.monotonic):
+        self._max_calls = max_calls
+        self._period = period_seconds
+        self._clock = clock
+        self._calls: Dict[int, Deque[float]] = defaultdict(deque)
+
+    def allow(self, key: int) -> bool:
+        now = self._clock()
+        calls = self._calls[key]
+        while calls and now - calls[0] >= self._period:
+            calls.popleft()
+        if len(calls) >= self._max_calls:
+            return False
+        calls.append(now)
+        return True

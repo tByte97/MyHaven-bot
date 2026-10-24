@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import date, datetime
 from pathlib import Path
@@ -67,7 +68,9 @@ class AIProcessor:
         return path.read_text(encoding="utf-8")
 
     async def _gemini_parse(self, prompt: str) -> dict[str, Any]:
-        response = self._gemini.generate_content(
+        # Синхронний SDK: виклик в окремому потоці, щоб не блокувати event loop.
+        response = await asyncio.to_thread(
+            self._gemini.generate_content,
             prompt,
             generation_config={"response_mime_type": "application/json"},
         )

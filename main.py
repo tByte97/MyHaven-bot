@@ -27,6 +27,9 @@ def _configure_logging() -> None:
             logging.StreamHandler(),
         ],
     )
+    # httpx на рівні INFO пише URL запитів до Telegram API разом із токеном бота.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

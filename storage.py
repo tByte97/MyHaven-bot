@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 import json
 import logging
+import os
 
 
 logger = logging.getLogger(__name__)
@@ -93,8 +94,12 @@ class LinkStore:
             self._links = raw
 
     def _write(self) -> None:
-        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        # Файл містить JWT користувачів: доступ лише власнику процесу.
+        self._file_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         payload = json.dumps(self._links, indent=2, ensure_ascii=True)
         tmp_path = self._file_path.with_name(f"{self._file_path.name}.tmp")
-        tmp_path.write_text(payload, encoding="utf-8")
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.chmod(tmp_path, 0o600)
         tmp_path.replace(self._file_path)

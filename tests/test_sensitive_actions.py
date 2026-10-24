@@ -135,7 +135,7 @@ class SensitiveActionTests(unittest.IsolatedAsyncioTestCase):
         self.services._ai.transcribe.assert_not_called()
 
     async def test_voice_transcript_with_password_is_not_echoed_or_sent_to_llm(self):
-        update = make_update(voice=MagicMock())
+        update = make_update(voice=MagicMock(duration=5))
         context = MagicMock()
         voice_file = MagicMock()
         voice_file.download_to_drive = AsyncMock()

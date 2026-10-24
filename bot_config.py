@@ -22,6 +22,9 @@ class BotConfig:
     whisper_model: str
     ollama_url: str
     ollama_model: str
+    voice_max_seconds: int = 60
+    ai_requests_per_minute: int = 10
+    upload_max_bytes: int = 10 * 1024 * 1024
 
 @dataclass(frozen=True)
 class AiConfig:
@@ -79,6 +82,12 @@ def load_config() -> BotConfig:
     ollama_model   = os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip()
 
 
+    voice_max_seconds = int(os.getenv("VOICE_MAX_SECONDS", "60").strip() or "60")
+    ai_requests_per_minute = int(os.getenv("AI_REQUESTS_PER_MINUTE", "10").strip() or "10")
+    upload_max_bytes = int(
+        os.getenv("STATEMENT_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)).strip() or str(10 * 1024 * 1024)
+    )
+
     return BotConfig(
         bot_token=bot_token,
         api_base_url=api_base_url,
@@ -91,4 +100,7 @@ def load_config() -> BotConfig:
         whisper_model=whisper_model,
         ollama_url=ollama_url,
         ollama_model=ollama_model,
+        voice_max_seconds=voice_max_seconds,
+        ai_requests_per_minute=ai_requests_per_minute,
+        upload_max_bytes=upload_max_bytes,
     )

@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import datetime
 import json
+import logging
 import os
 import re
 import tempfile
@@ -24,6 +26,7 @@ from .bot_config import BotConfig
 from .security import (
     SECRET_STEPS,
     SECURE_FLOW_STEPS,
+    SlidingWindowLimiter,
     delete_user_message,
     is_expired,
     looks_sensitive,
@@ -35,6 +38,8 @@ from .utils import format_response, parse_kv_args, parse_payload
 
 from telegrambot.ai_processor import AIProcessor
 
+
+logger = logging.getLogger(__name__)
 
 MENU_BUTTON = "📋 Меню"
 HELP_BUTTON = "ℹ️ Допомога"
@@ -161,6 +166,7 @@ class BotServices:
         self._pending_clarifications: Dict[int, Dict[str, Any]] = {}
         self._pending_quick_actions: Dict[int, Dict[str, str]] = {}
         self._pending_registrations: Dict[int, Dict[str, Any]] = {}
+        self._ai_limiter = SlidingWindowLimiter(config.ai_requests_per_minute, 60)
         self._ai = AIProcessor(
             whisper_model_size=config.whisper_model,
             provider=config.ai_provider,
@@ -1216,7 +1222,8 @@ class BotServices:
             await self._reply_text(update, "Спочатку прив'яжи акаунт кнопкою прив'язки.")
             return
 
-        file_name = update.message.document.file_name or ""
+        # Назву задає відправник: лише basename, щоб не вийти за межі tmp_dir.
+        file_name = Path(update.message.document.file_name or "").name or "statement"
         suffix = Path(file_name).suffix.lower()
         if suffix not in {".pdf", ".csv", ".xls", ".xlsx"}:
             await update.message.reply_text("Only PDF/CSV/XLS/XLSX files are supported.")
@@ -1227,6 +1234,12 @@ class BotServices:
         bank_name = args.get("bank_name")
         if not bank and not bank_name:
             await update.message.reply_text("Caption must include bank=ID or bank_name=NAME.")
+            return
+
+        file_size = update.message.document.file_size or 0
+        if file_size > self._config.upload_max_bytes:
+            limit_mb = self._config.upload_max_bytes // (1024 * 1024)
+            await self._reply_text(update, f"Файл завеликий. Максимум — {limit_mb} МБ.")
             return
 
         telegram_file = await context.bot.get_file(update.message.document.file_id)
@@ -1742,6 +1755,17 @@ class BotServices:
             await self._reply_text(update, "Для цього кроку надішли відповідь текстом, не голосом.")
             return
 
+        duration = update.message.voice.duration or 0
+        if duration > self._config.voice_max_seconds:
+            await self._reply_text(
+                update,
+                f"Голосове задовге. Максимум — {self._config.voice_max_seconds} с.",
+            )
+            return
+        if not self._ai_limiter.allow(update.effective_user.id):
+            await self._reply_text(update, "Забагато запитів. Зачекай хвилину й спробуй ще раз.")
+            return
+
         await self._reply_text(update, "🎤 Обробляю голосове повідомлення...")
 
         voice_file = await context.bot.get_file(update.message.voice.file_id)
@@ -1750,7 +1774,8 @@ class BotServices:
             audio_path = tmp.name
 
         try:
-            text = self._ai.transcribe(audio_path)
+            # Whisper синхронний і важкий: в окремому потоці, щоб не блокувати бота.
+            text = await asyncio.to_thread(self._ai.transcribe, audio_path)
             if looks_sensitive(text):
                 await self._reply_sensitive_text_blocked(update)
                 return
@@ -1767,8 +1792,9 @@ class BotServices:
                 )
             intent = await self._ai.parse_intent(text, context=context_text)
             await self._dispatch_intent(update, intent, raw_text=text)
-        except Exception as exc:
-            await self._reply_text(update, f"❌ Помилка: {exc}")
+        except Exception:
+            logger.exception("Помилка обробки голосового повідомлення")
+            await self._reply_text(update, "❌ Не вдалося обробити голосове. Спробуй ще раз.")
         finally:
             os.unlink(audio_path)
 
@@ -1825,11 +1851,16 @@ class BotServices:
                 f"Уточнення користувача: {text}"
             )
 
+        if not self._ai_limiter.allow(update.effective_user.id):
+            await self._reply_text(update, "Забагато запитів. Зачекай хвилину й спробуй ще раз.")
+            return
+
         try:
             intent = await self._ai.parse_intent(text, context=context_text)
             await self._dispatch_intent(update, intent, raw_text=text)
-        except Exception as exc:
-            await self._reply_text(update, f"Не зміг розібрати повідомлення: {exc}")
+        except Exception:
+            logger.exception("Помилка розбору текстового повідомлення")
+            await self._reply_text(update, "Не зміг розібрати повідомлення. Спробуй сформулювати інакше.")
 
 
 
