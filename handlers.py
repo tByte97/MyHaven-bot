@@ -10,7 +10,7 @@ from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Optional, Dict, Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
@@ -571,10 +571,12 @@ class BotServices:
             await update.message.reply_text("WebApp URL is not configured.")
             return
 
-        webapp_url = self._config.webapp_url
-        link = self._require_link(update)
-        if link:
-            webapp_url = self._build_webapp_url(link.access_token)
+        if not self._require_link(update):
+            await self._reply_text(update, "Спочатку прив'яжи акаунт кнопкою прив'язки.")
+            return
+
+        # Токен у URL не передаємо: WebApp входить за підписаним Telegram initData.
+        webapp_url = self._build_webapp_url()
 
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Open WebApp", web_app=WebAppInfo(webapp_url))]]
@@ -1197,15 +1199,13 @@ class BotServices:
         self._store.save(account)
         await self._reply_text(update, "Акаунт успішно прив'язано.")
 
-    def _build_webapp_url(self, access_token: str) -> str:
+    def _build_webapp_url(self) -> str:
         base = self._config.webapp_url or ""
         parts = urlsplit(base)
         path = parts.path.rstrip("/")
         if not path.endswith("/telegram-webapp"):
             path = f"{path}/telegram-webapp" if path else "/telegram-webapp"
-        query = dict(parse_qsl(parts.query, keep_blank_values=True))
-        query["access_token"] = access_token
-        return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), parts.fragment))
+        return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
     async def upload_document(
         self,
