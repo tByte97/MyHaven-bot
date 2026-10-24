@@ -21,6 +21,14 @@ from .backend_client import (
     build_users_path,
 )
 from .bot_config import BotConfig
+from .security import (
+    SECRET_STEPS,
+    SECURE_FLOW_STEPS,
+    delete_user_message,
+    is_expired,
+    looks_sensitive,
+    utc_now_iso,
+)
 from .storage import LinkStore, LinkedAccount
 from .text_normalization import clean_transaction_description, resolve_spoken_category
 from .utils import format_response, parse_kv_args, parse_payload
@@ -53,6 +61,21 @@ UPDATE_BUDGET_BUTTON = "✏️ Оновити бюджет"
 DELETE_BUDGET_BUTTON = "🗑 Видалити бюджет"
 DELETE_ACCOUNT_CONFIRM_TEXT = "ПІДТВЕРДЖУЮ ВИДАЛЕННЯ"
 REGISTRATION_CONFIRM_TEXT = "ПІДТВЕРДЖУЮ РЕЄСТРАЦІЮ"
+SENSITIVE_COMMANDS_HELP = (
+    "Дії з паролем виконуються лише командами, пароль ніколи не передається AI:\n"
+    "/change_password — змінити пароль\n"
+    "/disable_2fa — вимкнути 2FA\n"
+    "/delete_account — видалити акаунт"
+)
+SECURE_FLOW_PROMPTS = {
+    "old_password": "Надішли поточний пароль окремим повідомленням. Я одразу видалю його з чату.",
+    "new_password": "Тепер надішли новий пароль окремим повідомленням. Я одразу видалю його з чату.",
+    "password": "Надішли пароль окремим повідомленням. Я одразу видалю його з чату.",
+    "confirm_phrase": (
+        "Видалення акаунта незворотне. Для підтвердження надішли точну фразу "
+        f"«{DELETE_ACCOUNT_CONFIRM_TEXT}»."
+    ),
+}
 
 LANGUAGE_CHOICES = {
     "uk": "Українська",
@@ -175,7 +198,8 @@ class BotServices:
                 "Також можна просто написати природною мовою або надіслати голосове повідомлення, наприклад: "
                 "\"додав витрату 250 грн на продукти\", \"покажи мій профіль\", "
                 "\"зміни тему на темну\", \"увімкни 2FA\", \"експортуй мої дані\".\n"
-                "Для імпорту виписки надішли PDF/CSV/XLS/XLSX з підписом bank=ID або bank_name=NAME."
+                "Для імпорту виписки надішли PDF/CSV/XLS/XLSX з підписом bank=ID або bank_name=NAME.\n\n"
+                f"{SENSITIVE_COMMANDS_HELP}"
             ),
             reply_markup=self._extra_keyboard(),
         )
@@ -816,6 +840,8 @@ class BotServices:
 
         step_index = int(registration.get("step_index", 0))
         field = self._registration_field_name(step_index)
+        if field == "password":
+            await delete_user_message(update)
         value, error_message = self._parse_registration_value(field, text)
         if error_message:
             await self._reply_text(update, error_message)
@@ -1134,6 +1160,7 @@ class BotServices:
         if not secret:
             await self._reply_text(update, "Надішли секретний ключ прив'язки.")
             return
+        await delete_user_message(update)
 
         access_token, refresh_token, error = await self._resolve_secret(
             secret,
@@ -1532,6 +1559,111 @@ class BotServices:
         cleaned = re.sub(r"[\s,.;:!?]+$", "", cleaned)
         return cleaned.strip() or text.strip()
 
+    async def change_password_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._start_secure_flow(update, "change_password")
+
+    async def disable_totp_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._start_secure_flow(update, "disable_totp")
+
+    async def delete_account_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._start_secure_flow(update, "delete_account")
+
+    async def _start_secure_flow(self, update: Update, action: str) -> None:
+        # Дії з паролем: кроки збирає бот локально, без LLM.
+        if not update.effective_user:
+            return
+        if not self._require_link(update):
+            await self._reply_text(update, "Спочатку прив'яжи акаунт кнопкою прив'язки.")
+            return
+
+        steps = SECURE_FLOW_STEPS[action]
+        # Інакше пароль могла б перехопити незавершена швидка дія («введи ID»).
+        self._pending_quick_actions.pop(update.effective_user.id, None)
+        self._pending_clarifications[update.effective_user.id] = {
+            "kind": "secure_input",
+            "action": action,
+            "step_index": 0,
+            "data": {},
+            "created_at": utc_now_iso(),
+        }
+        await self._reply_text(
+            update,
+            f"{SECURE_FLOW_PROMPTS[steps[0]]}\nНапиши «скасувати», щоб зупинити.",
+        )
+
+    async def _handle_secure_input(self, update: Update, pending: Dict[str, Any], text: str) -> bool:
+        user_id = update.effective_user.id
+        action = pending["action"]
+        steps = SECURE_FLOW_STEPS[action]
+        step_index = int(pending.get("step_index", 0))
+        step = steps[step_index]
+
+        if step in SECRET_STEPS:
+            await delete_user_message(update)
+
+        if text.strip().lower() in {"cancel", "скасувати"}:
+            self._pending_clarifications.pop(user_id, None)
+            await self._reply_text(update, "Скасовано.")
+            return True
+
+        if is_expired(pending):
+            self._pending_clarifications.pop(user_id, None)
+            await self._reply_text(update, "Час на підтвердження вийшов. Почни дію ще раз.")
+            return True
+
+        if step == "confirm_phrase":
+            if text.strip().upper() != DELETE_ACCOUNT_CONFIRM_TEXT:
+                await self._reply_text(
+                    update,
+                    f"{SECURE_FLOW_PROMPTS[step]}\nАбо напиши «скасувати».",
+                )
+                return True
+        else:
+            pending["data"][step] = text.strip()
+
+        if step_index + 1 < len(steps):
+            pending["step_index"] = step_index + 1
+            await self._reply_text(update, SECURE_FLOW_PROMPTS[steps[step_index + 1]])
+            return True
+
+        self._pending_clarifications.pop(user_id, None)
+        data = pending["data"]
+        if action == "change_password":
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("change-password"),
+                json={"old_password": data["old_password"], "new_password": data["new_password"]},
+            )
+        elif action == "disable_totp":
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("totp/disable"),
+                json={"password": data["password"]},
+            )
+        else:
+            result = await self._call_api(
+                update,
+                "POST",
+                build_users_path("delete-account"),
+                json={"password": data["password"]},
+            )
+            if not result.error:
+                self._store.remove(user_id)
+
+        await self._reply_result(update, result)
+        return True
+
+    async def _reply_sensitive_text_blocked(self, update: Update) -> None:
+        await self._reply_text(
+            update,
+            (
+                "Схоже, повідомлення стосується пароля. Такі повідомлення я не передаю AI "
+                f"і видаляю з чату.\n\n{SENSITIVE_COMMANDS_HELP}"
+            ),
+        )
+
     async def _try_handle_pending_reply(self, update: Update, text: str) -> bool:
         if not update.effective_user:
             return False
@@ -1540,6 +1672,9 @@ class BotServices:
             return False
 
         kind = pending.get("kind")
+
+        if kind == "secure_input":
+            return await self._handle_secure_input(update, pending, text)
 
         if kind == "totp_enable":
             if text.strip().lower() in {"cancel", "скасувати"}:
@@ -1565,36 +1700,6 @@ class BotServices:
 
             if not result.error:
                 self._pending_clarifications.pop(update.effective_user.id, None)
-
-            await self._reply_result(update, result)
-            return True
-
-        if kind == "delete_account_confirmation":
-            normalized = text.strip().upper()
-            if text.strip().lower() in {"cancel", "скасувати"}:
-                self._pending_clarifications.pop(update.effective_user.id, None)
-                await self._reply_text(update, "Видалення акаунта скасовано.")
-                return True
-
-            if normalized != DELETE_ACCOUNT_CONFIRM_TEXT:
-                await self._reply_text(
-                    update,
-                    (
-                        "Для підтвердження надішли точну фразу "
-                        f"«{DELETE_ACCOUNT_CONFIRM_TEXT}» або напиши «скасувати»."
-                    ),
-                )
-                return True
-
-            self._pending_clarifications.pop(update.effective_user.id, None)
-            result = await self._call_api(
-                update,
-                "POST",
-                build_users_path("delete-account"),
-                json={"password": pending.get("password")},
-            )
-            if not result.error:
-                self._store.remove(update.effective_user.id)
 
             await self._reply_result(update, result)
             return True
@@ -1632,6 +1737,11 @@ class BotServices:
             await self._reply_text(update, "⚠️ Спочатку прив'яжи акаунт кнопкою прив'язки.")
             return
 
+        pending = self._pending_clarifications.get(update.effective_user.id)
+        if pending and pending.get("kind") == "secure_input":
+            await self._reply_text(update, "Для цього кроку надішли відповідь текстом, не голосом.")
+            return
+
         await self._reply_text(update, "🎤 Обробляю голосове повідомлення...")
 
         voice_file = await context.bot.get_file(update.message.voice.file_id)
@@ -1641,6 +1751,9 @@ class BotServices:
 
         try:
             text = self._ai.transcribe(audio_path)
+            if looks_sensitive(text):
+                await self._reply_sensitive_text_blocked(update)
+                return
             await self._reply_text(update, f"🗣 «{text}»")
             if await self._try_handle_pending_reply(update, text):
                 return
@@ -1696,6 +1809,11 @@ class BotServices:
                     "«Створити акаунт». Якщо профіль уже існує, скористайся кнопкою прив'язки."
                 ),
             )
+            return
+
+        if looks_sensitive(text):
+            await delete_user_message(update)
+            await self._reply_sensitive_text_blocked(update)
             return
 
         pending = self._pending_clarifications.get(update.effective_user.id)
@@ -2041,22 +2159,11 @@ class BotServices:
             )
             retry = None
 
-        elif action == "change_password":
-            old_password = intent.get("old_password")
-            new_password = intent.get("new_password")
-            if not old_password or not new_password:
-                await self._reply_text(update, "Потрібне уточнення: потрібен поточний і новий пароль.")
-                return
-            result = await self._call_api(
-                update,
-                "POST",
-                build_users_path("change-password"),
-                json={
-                    "old_password": old_password,
-                    "new_password": new_password,
-                },
-            )
-            retry = None
+        elif action in SECURE_FLOW_STEPS:
+            # Паролі й підтвердження з відповіді LLM ігноруються навмисно:
+            # їх збирає локальний покроковий сценарій.
+            await self._start_secure_flow(update, action)
+            return
 
         elif action == "setup_totp":
             result = await self._call_api(update, "GET", build_users_path("totp/setup"))
@@ -2106,19 +2213,6 @@ class BotServices:
                 }
             retry = None
 
-        elif action == "disable_totp":
-            password = intent.get("password")
-            if not password:
-                await self._reply_text(update, "Потрібне уточнення: введи пароль для вимкнення 2FA.")
-                return
-            result = await self._call_api(
-                update,
-                "POST",
-                build_users_path("totp/disable"),
-                json={"password": password},
-            )
-            retry = None
-
         elif action == "verify_totp":
             code = intent.get("code") or self._extract_totp_code(raw_text or "")
             if not code:
@@ -2157,37 +2251,6 @@ class BotServices:
                 return
             await self._send_export_document(update, result.data)
             return
-
-        elif action == "delete_account":
-            password = intent.get("password")
-            confirmed = bool(intent.get("confirmed"))
-            if not password:
-                await self._reply_text(update, "Потрібне уточнення: введи пароль для видалення акаунта.")
-                return
-            if not confirmed:
-                if user_id is not None:
-                    self._pending_clarifications[user_id] = {
-                        "kind": "delete_account_confirmation",
-                        "password": password,
-                        "created_at": datetime.datetime.utcnow().isoformat(),
-                    }
-                await self._reply_text(
-                    update,
-                    (
-                        "Це незворотна дія. Для підтвердження надішли точну фразу "
-                        f"«{DELETE_ACCOUNT_CONFIRM_TEXT}» або напиши «скасувати»."
-                    ),
-                )
-                return
-            result = await self._call_api(
-                update,
-                "POST",
-                build_users_path("delete-account"),
-                json={"password": password},
-            )
-            if not result.error and user_id is not None:
-                self._store.remove(user_id)
-            retry = None
 
         elif action == "get_uploads":
             result = await self._call_api(update, "GET", build_transactions_api_path("uploads"))
@@ -2254,6 +2317,9 @@ def register_handlers(application: Any, services: BotServices) -> None:
     application.add_handler(CommandHandler("update_budget", services.budget_update))
     application.add_handler(CommandHandler("delete_budget", services.budget_delete))
     application.add_handler(CommandHandler("webapp", services.webapp))
+    application.add_handler(CommandHandler("change_password", services.change_password_command))
+    application.add_handler(CommandHandler("disable_2fa", services.disable_totp_command))
+    application.add_handler(CommandHandler("delete_account", services.delete_account_command))
     application.add_handler(MessageHandler(filters.Document.ALL, services.upload_document))
     application.add_handler(MessageHandler(filters.VOICE, services.voice_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, services.text_message))
